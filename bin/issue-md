@@ -1,0 +1,292 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# =============================================================================
+# issue-md
+#
+# Export a GitLab issue as clean Markdown (title, description, comments,
+# related issues, images).
+#
+# Usage:
+#   issue-md <ISSUE_URL>                          # Print markdown to stdout
+#   issue-md -o issue.md <ISSUE_URL>              # Write to file
+#   issue-md -d ./images <ISSUE_URL>              # Download images locally
+#   issue-md -t glpat-xxx <ISSUE_URL>             # Override token
+#
+# Configuration (priority: defaults < config.yml < env vars < CLI flags):
+#   ~/.issue-md/config.yml    Central config file
+#   GITLAB_API_TOKEN          Personal Access Token with api scope
+# =============================================================================
+
+VERSION = '0.1.0'
+
+require 'bundler/inline'
+
+gemfile(true) do
+  source 'https://rubygems.org'
+  gem 'gitlab', '~> 5.0'
+end
+
+require 'fileutils'
+require 'net/http'
+require 'net/https'
+require 'optparse'
+require 'uri'
+require 'yaml'
+
+# ── Exceptions ────────────────────────────────────────────────────────────────
+
+class IssueMdError < StandardError; end
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+module Config
+  CONFIG_DIR  = File.expand_path('~/.issue-md')
+  CONFIG_PATH = File.join(CONFIG_DIR, 'config.yml')
+
+  DEFAULTS = {
+    'gitlab_api_token' => nil
+  }.freeze
+
+  ENV_MAPPING = {
+    'GITLAB_API_TOKEN' => 'gitlab_api_token'
+  }.freeze
+
+  def self.load(cli_overrides = {})
+    config = DEFAULTS.dup
+
+    if File.exist?(CONFIG_PATH)
+      yaml = YAML.safe_load(File.read(CONFIG_PATH)) || {}
+      yaml.each { |k, v| config[k] = v unless v.nil? }
+    end
+
+    ENV_MAPPING.each do |env_key, config_key|
+      config[config_key] = ENV[env_key] if ENV.key?(env_key)
+    end
+
+    cli_overrides.each { |k, v| config[k] = v unless v.nil? }
+    config
+  end
+end
+
+# ── URL parsing ───────────────────────────────────────────────────────────────
+
+module UrlParser
+  def self.parse(url)
+    uri = URI.parse(url)
+    raise IssueMdError, "Expected an http(s) URL, got: #{url}" unless %w[http https].include?(uri.scheme)
+
+    path_before, _, issue_segment = uri.path.partition('/-/issues/')
+    raise IssueMdError, "URL does not look like a GitLab issue: #{url}" if issue_segment.empty?
+
+    iid = issue_segment.split('/').first.to_i
+    raise IssueMdError, "Could not extract issue IID from: #{url}" if iid.zero?
+
+    host = uri.port && ![80, 443].include?(uri.port) ? "#{uri.host}:#{uri.port}" : uri.host
+
+    { base_url: "#{uri.scheme}://#{host}",
+      project_path: path_before.delete_prefix('/'),
+      issue_iid: iid }
+  end
+end
+
+# ── Image downloading ─────────────────────────────────────────────────────────
+
+module ImageDownloader
+  module_function
+
+  def build_opts(base_url:, token:, project_path:, dest_dir:)
+    { gitlab_url: base_url, token: token, project_path: project_path, dest_dir: dest_dir }
+  end
+
+  def maybe_download(text, img_opts)
+    return text unless img_opts
+
+    download_images(text, **img_opts)
+  end
+
+  def download_images(text, gitlab_url:, project_path:, token:, dest_dir:)
+    state = { image_dir: File.join(dest_dir, '.issue-md-images'), downloaded: false }
+    opts = { gitlab_url: gitlab_url, project_path: project_path, token: token }
+
+    text.gsub(%r{!\[([^\]]*)\]\((/uploads/[^)]+)\)(\{[^}]*\})?}) do
+      replace_reference(::Regexp.last_match(1), ::Regexp.last_match(2), opts, state)
+    end
+  end
+
+  def replace_reference(alt, upload_path, opts, state)
+    url = "#{opts[:gitlab_url]}/#{opts[:project_path]}#{upload_path}"
+    filename = File.basename(upload_path)
+    local_path = File.join(state[:image_dir], filename)
+
+    ensure_dir(state)
+    download_and_save(url, opts[:token], local_path, alt, filename)
+  rescue StandardError => e
+    "[Image: #{filename} -- download failed: #{e.class}: #{e.message}]"
+  end
+
+  def ensure_dir(state)
+    return if state[:downloaded]
+
+    FileUtils.mkdir_p(state[:image_dir])
+    state[:downloaded] = true
+  end
+
+  def download_and_save(url, token, local_path, alt, filename)
+    response = http_get_with_redirects(url, token)
+    return "[Image: #{filename} -- download failed (#{response.code})]" unless response.is_a?(Net::HTTPSuccess)
+
+    validate_and_write(response, local_path, alt, filename)
+  end
+
+  def http_get_with_redirects(url, token)
+    uri = URI.parse(url)
+    response = nil
+    3.times do
+      response = single_get(uri, token)
+      break unless response.is_a?(Net::HTTPRedirection) && response['location']
+
+      uri = URI.parse(response['location'])
+    end
+    response
+  end
+
+  def single_get(uri, token)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    request = Net::HTTP::Get.new(uri.request_uri)
+    request['PRIVATE-TOKEN'] = token
+    http.request(request)
+  end
+
+  def validate_and_write(response, local_path, alt, filename)
+    body = response.body
+    content_type = response['content-type'].to_s
+    if body.nil? || body.empty? || !content_type.start_with?('image/')
+      return "[Image: #{filename} -- unsupported format (#{content_type})]"
+    end
+
+    File.binwrite(local_path, body)
+    "![#{alt}](#{local_path})"
+  end
+end
+
+# ── Issue formatting ──────────────────────────────────────────────────────────
+
+module IssueFormatter
+  module_function
+
+  def build_header(issue, img_opts)
+    lines = ["# Issue ##{issue.iid}: #{issue.title}", '']
+    if issue.description && !issue.description.empty?
+      lines << ImageDownloader.maybe_download(issue.description.to_s, img_opts)
+    end
+    lines << ''
+    lines
+  end
+
+  def append_comments(lines, client, project_path, issue_iid, img_opts)
+    notes = client.issue_notes(project_path, issue_iid, per_page: 100)
+    user_notes = notes.reject(&:system)
+    return unless user_notes.any?
+
+    lines << '## Comments'
+    lines << ''
+    user_notes.each { |note| append_single_comment(lines, note, img_opts) }
+  rescue Gitlab::Error::ResponseError
+    # Non-fatal: proceed without comments
+  end
+
+  def append_single_comment(lines, note, img_opts)
+    lines << "### #{note.author&.name || 'Unknown'} (#{note.created_at})"
+    lines << ImageDownloader.maybe_download(note.body.to_s, img_opts)
+    lines << ''
+  end
+
+  def append_links(lines, client, project_path, issue_iid)
+    links = client.issue_links(project_path, issue_iid)
+    return unless links.any?
+
+    lines << '## Related issues'
+    lines << ''
+    links.each { |link| lines << "- ##{link.iid}: #{link.title} (#{link.state})" }
+    lines << ''
+  rescue Gitlab::Error::ResponseError, NoMethodError
+    # Non-fatal: some GitLab versions don't support this
+  end
+end
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+
+def fetch_issue(client, project_path, issue_iid, img_opts)
+  issue = client.issue(project_path, issue_iid)
+  lines = IssueFormatter.build_header(issue, img_opts)
+  IssueFormatter.append_comments(lines, client, project_path, issue_iid, img_opts)
+  IssueFormatter.append_links(lines, client, project_path, issue_iid)
+  lines.join("\n")
+end
+
+def build_client(base_url, token)
+  raise IssueMdError, 'Missing GitLab API token (set GITLAB_API_TOKEN, use -t, or add to ~/.issue-md/config.yml)' unless token
+
+  Gitlab.client(endpoint: "#{base_url}/api/v4", private_token: token)
+end
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def parse_args(argv)
+  cli_overrides = {}
+  opts = {}
+
+  parser = OptionParser.new do |o|
+    o.banner = 'Usage: issue-md [options] <ISSUE_URL>'
+    o.on('-t', '--token TOKEN', 'GitLab API token') { |v| cli_overrides['gitlab_api_token'] = v }
+    o.on('-o', '--output FILE', 'Write markdown to FILE instead of stdout') { |v| opts[:output_file] = v }
+    o.on('-d', '--download-images DIR', 'Download images to DIR') { |v| opts[:download_dir] = v }
+    o.on('-v', '--version', 'Show version and exit') { puts "issue-md #{VERSION}"; exit 0 }
+    o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
+  end
+
+  parser.parse!(argv)
+  raise IssueMdError, "Expected exactly one issue URL argument.\n\n#{parser}" if argv.size != 1
+
+  config = Config.load(cli_overrides)
+  parsed = UrlParser.parse(argv.first)
+
+  opts.merge(config: config, **parsed)
+end
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main
+  args = parse_args(ARGV)
+  token = args[:config]['gitlab_api_token']
+  client = build_client(args[:base_url], token)
+
+  img_opts = nil
+  if args[:download_dir]
+    img_opts = ImageDownloader.build_opts(
+      base_url: args[:base_url], token: token,
+      project_path: args[:project_path], dest_dir: args[:download_dir]
+    )
+  end
+
+  markdown = fetch_issue(client, args[:project_path], args[:issue_iid], img_opts)
+
+  if args[:output_file]
+    File.write(args[:output_file], markdown)
+    $stderr.puts "Written to #{args[:output_file]}"
+  else
+    puts markdown
+  end
+rescue IssueMdError => e
+  $stderr.puts "error: #{e.message}"
+  exit 1
+rescue Gitlab::Error::ResponseError => e
+  $stderr.puts "GitLab API error: #{e.message}"
+  exit 1
+rescue Interrupt
+  exit 130
+end
+
+main
