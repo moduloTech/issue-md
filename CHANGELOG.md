@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Support for `/-/work_items/` URLs (GitLab work items), in addition to `/-/issues/`.
+- URL fragments (`#note_...`) are now ignored during parsing.
+
 ## [0.1.0] - 2026-04-10
 
 ### Added

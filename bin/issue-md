@@ -96,17 +96,27 @@ module UrlParser
     raise IssueMdError, "Expected an http(s) URL, got: #{url}"
   end
 
-  def self.extract_path_and_iid(uri, url)
-    path_before, _, issue_segment = uri.path.partition('/-/issues/')
-    raise IssueMdError, "URL does not look like a GitLab issue: #{url}" if issue_segment.empty?
+  ISSUE_PATTERNS = %w[/-/issues/ /-/work_items/].freeze
 
-    iid = issue_segment.split('/').first.to_i
+  def self.extract_path_and_iid(uri, url)
+    path_before, issue_segment = try_patterns(uri.path)
+    raise IssueMdError, "URL does not look like a GitLab issue: #{url}" unless issue_segment
+
+    iid = issue_segment.split(%r{[/#]}).first.to_i
     raise IssueMdError, "Could not extract issue IID from: #{url}" if iid.zero?
 
     [path_before.delete_prefix('/'), iid]
   end
 
-  private_class_method :validate_scheme!, :extract_path_and_iid
+  def self.try_patterns(path)
+    ISSUE_PATTERNS.each do |pattern|
+      before, _, segment = path.partition(pattern)
+      return [before, segment] unless segment.empty?
+    end
+    nil
+  end
+
+  private_class_method :validate_scheme!, :extract_path_and_iid, :try_patterns
 end
 
 # ── Image downloading ─────────────────────────────────────────────────────────
