@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-17
+
 ### Fixed
 
 - Comments are now displayed in chronological order (oldest first) instead of reverse.
