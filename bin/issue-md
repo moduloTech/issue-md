@@ -220,7 +220,7 @@ module IssueFormatter
   end
 
   def append_comments(lines, client, project_path, issue_iid, img_opts)
-    notes = client.issue_notes(project_path, issue_iid, per_page: 100)
+    notes = client.issue_notes(project_path, issue_iid, per_page: 100, order_by: 'created_at', sort: 'asc')
     user_notes = notes.reject(&:system)
     return unless user_notes.any?
 
