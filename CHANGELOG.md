@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-17
+
+### Added
+
+- Include open merge requests related to the issue: branch name, full discussions (general and diff comments), resolved status, and diff snippets when available.
+
 ## [0.1.1] - 2026-04-17
 
 ### Fixed

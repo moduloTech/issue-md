@@ -18,7 +18,7 @@
 #   GITLAB_API_TOKEN          Personal Access Token with api scope
 # =============================================================================
 
-VERSION = '0.1.1'
+VERSION = '0.2.0'
 
 require 'bundler/inline'
 
@@ -250,6 +250,91 @@ module IssueFormatter
   end
 end
 
+# ── Merge Request formatting ─────────────────────────────────────────────────
+
+# Fetches open MRs related to the issue and renders their discussions.
+module MergeRequestFormatter
+  module_function
+
+  def append_merge_requests(lines, client, project_path, issue_iid, img_opts)
+    mrs = client.related_merge_requests(project_path, issue_iid)
+    open_mrs = mrs.select { |mr| mr.state == 'opened' }
+    return unless open_mrs.any?
+
+    lines << '## Merge Requests'
+    lines << ''
+    open_mrs.each { |mr| append_merge_request(lines, client, project_path, mr, img_opts) }
+  rescue Gitlab::Error::ResponseError, NoMethodError
+    # Non-fatal: proceed without MR data
+  end
+
+  def append_merge_request(lines, client, project_path, merge_request, img_opts)
+    lines << "### !#{merge_request.iid}: #{merge_request.title} (`#{merge_request.source_branch}`)"
+    lines << ''
+    append_discussions(lines, client, project_path, merge_request.iid, img_opts)
+  end
+
+  def append_discussions(lines, client, project_path, mr_iid, img_opts)
+    discussions = client.merge_request_discussions(project_path, mr_iid, per_page: 100)
+    discussions.each do |disc|
+      user_notes = (disc.notes || []).reject(&:system)
+      next if user_notes.empty?
+
+      append_discussion(lines, disc, user_notes, img_opts)
+    end
+  rescue Gitlab::Error::ResponseError
+    # Non-fatal: proceed without discussions
+  end
+
+  def append_discussion(lines, disc, notes, img_opts)
+    lines << discussion_header(disc, notes.first)
+    lines << ''
+    maybe_append_diff_snippet(lines, notes.first)
+    notes.each { |note| append_note(lines, note, img_opts) }
+  end
+
+  def discussion_header(disc, first_note)
+    label = location_label(first_note) || 'Discussion'
+    resolved = disc.respond_to?(:resolved) && disc.resolved ? ' (résolu)' : ''
+    "#### #{label}#{resolved}"
+  end
+
+  def location_label(note)
+    return nil unless note.respond_to?(:position) && note.position
+
+    pos = note.position
+    path = safe_field(pos, :new_path) || safe_field(pos, :old_path)
+    return nil unless path
+
+    line = safe_field(pos, :new_line) || safe_field(pos, :old_line)
+    line ? "`#{path}:#{line}`" : "`#{path}`"
+  end
+
+  def maybe_append_diff_snippet(lines, note)
+    return unless note.respond_to?(:position) && note.position
+
+    hunk = safe_field(note, :diff_hunk)
+    return unless hunk && !hunk.empty?
+
+    lines << '```diff'
+    lines << hunk
+    lines << '```'
+    lines << ''
+  end
+
+  def safe_field(obj, field)
+    return nil unless obj.respond_to?(field)
+
+    obj.send(field)
+  end
+
+  def append_note(lines, note, img_opts)
+    lines << "**#{note.author&.name || 'Unknown'}** (#{note.created_at})"
+    lines << ImageDownloader.maybe_download(note.body.to_s, img_opts)
+    lines << ''
+  end
+end
+
 # ── Core ──────────────────────────────────────────────────────────────────────
 
 def fetch_issue(client, project_path, issue_iid, img_opts)
@@ -257,6 +342,7 @@ def fetch_issue(client, project_path, issue_iid, img_opts)
   lines = IssueFormatter.build_header(issue, img_opts)
   IssueFormatter.append_comments(lines, client, project_path, issue_iid, img_opts)
   IssueFormatter.append_links(lines, client, project_path, issue_iid)
+  MergeRequestFormatter.append_merge_requests(lines, client, project_path, issue_iid, img_opts)
   lines.join("\n")
 end
 
